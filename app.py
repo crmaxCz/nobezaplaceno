@@ -3,7 +3,7 @@ import subprocess
 import os
 import pandas as pd
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Funkce pro instalaci prohlížeče, pokud chybí
 def install_playwright_browser():
@@ -39,49 +39,71 @@ USER = st.secrets["moje_jmeno"]
 PW = st.secrets["moje_heslo"]
 
 # --- FUNKCE S CACHE ---
-@st.cache_data(show_spinner="Analyzuji termíny...", ttl=3600)
+@st.cache_data(show_spinner="Analyzuji termíny (následující 3 měsíce)...", ttl=3600)
 def get_pobocka_data(pobocka_id, pobocka_nazev, username, password):
     data_list = []
-    dnes = datetime.now().strftime("%d.%m.%Y")
+    
+    # 1. Nastavení datumu: Dnes a za 3 měsíce
+    dnes_obj = datetime.now()
+    budoucno_obj = dnes_obj + timedelta(days=90)
+    
+    dnes = dnes_obj.strftime("%d.%m.%Y")
+    budoucno = budoucno_obj.strftime("%d.%m.%Y")
     
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         
-        # Přihlášení (používáme tvoje zjištěné názvy polí)
+        # Přihlášení
         page.goto("https://nobe.moje-autoskola.cz/index.php")
         page.fill('input[name="log_email"]', username)
         page.fill('input[name="log_heslo"]', password)
         page.click('input[type="submit"]')
         page.wait_for_load_state("networkidle")
         
-        url_seznam = f"https://nobe.moje-autoskola.cz/admin_prednasky.php?vytez_datum_od={dnes}&vytez_typ=545&vytez_lokalita={pobocka_id}&akce=prednasky_filtr"
+        # 2. Použití tvé přesné URL s filtrem na 3 měsíce
+        url_seznam = f"https://nobe.moje-autoskola.cz/admin_prednasky.php?vytez_datum_od={dnes}&vytez_datum_do={budoucno}&vytez_typ=545&vytez_ucitel=&vytez_lokalita={pobocka_id}&akce=prednasky_filtr"
         page.goto(url_seznam)
+        page.wait_for_load_state("networkidle")
         
+        # Najdeme všechny odkazy obsahující edit_id
         links = page.query_selector_all("a[href*='admin_prednaska.php?edit_id=']")
         urls = list(set([l.get_attribute("href") for l in links]))
         
+        if not urls:
+            # Debug: Pokud nic nenajde, zkusíme vypsat, co na stránce vůbec je
+            return pd.DataFrame()
+
         for detail_url in urls:
-            page.goto(f"https://nobe.moje-autoskola.cz/{detail_url}")
+            # Ujistíme se, že máme celou URL
+            full_url = detail_url if "http" in detail_url else f"https://nobe.moje-autoskola.cz/{detail_url}"
+            page.goto(full_url)
+            
             try:
+                # Získání názvu termínu
                 termin_name = page.inner_text("h1").replace("Přednáška - ", "").strip()
-                rows = page.query_selector_all("#table_seznam_zaku tr")
                 
+                # Tabulka žáků
+                rows = page.query_selector_all("#table_seznam_zaku tr")
                 prihlaseno = 0
                 uhrazeno = 0
-                raw_values = []
                 
                 for row in rows:
                     cells = row.query_selector_all("td")
+                    # Předpokládáme, že řádek s žákem má dostatek buněk
                     if len(cells) > 5:
                         prihlaseno += 1
                         text_uhrazeno = cells[5].inner_text().strip()
-                        raw_values.append(text_uhrazeno)
                         
-                        casti = text_uhrazeno.split('z')
-                        if len(casti) > 1:
-                            prvni_cast = casti[0]
-                            jen_cisla = re.sub(r'\D', '', prvni_cast)
+                        # Pokud je v buňce "z", znamená to formát "zaplaceno z celkem"
+                        if 'z' in text_uhrazeno:
+                            casti = text_uhrazeno.split('z')
+                            zaplaceno_raw = re.sub(r'\D', '', casti[0])
+                            if zaplaceno_raw and int(zaplaceno_raw) > 0:
+                                uhrazeno += 1
+                        else:
+                            # Záložní plán, pokud tam 'z' není - hledáme jakékoliv číslo
+                            jen_cisla = re.sub(r'\D', '', text_uhrazeno)
                             if jen_cisla and int(jen_cisla) > 0:
                                 uhrazeno += 1
                 
@@ -89,28 +111,20 @@ def get_pobocka_data(pobocka_id, pobocka_nazev, username, password):
                     data_list.append({
                         "Termín": termin_name,
                         "Přihlášeno": prihlaseno,
-                        "Uhrazeno": uhrazeno,
-                        "DEBUG_TEXT": ", ".join(raw_values[:3])
+                        "Uhrazeno": uhrazeno
                     })
             except:
                 continue
                 
         browser.close()
 
-    # --- TADY BYLA CHYBA (Původně jsi zde měl return pd.DataFrame(data_list), což ukončilo funkci předčasně) ---
+    # Vytvoření a seřazení DF
     new_df = pd.DataFrame(data_list)
-    
     if not new_df.empty:
-        try:
-            # Vytvoříme pomocný sloupec pro řazení podle data
-            # Bere první část textu (např. 5.3.2025) a převede na datum
-            new_df['datum_obj'] = pd.to_datetime(new_df['Termín'].str.split(' ').str[0], dayfirst=True, errors='coerce')
-            new_df = new_df.sort_values('datum_obj')
-            new_df = new_df.drop(columns=['datum_obj'])
-        except Exception as e:
-            st.error(f"Chyba při řazení: {e}")
-            
-    return new_df # Teď už vrací správně seřazenou tabulku
+        new_df['datum_obj'] = pd.to_datetime(new_df['Termín'].str.split(' ').str[0], dayfirst=True, errors='coerce')
+        new_df = new_df.sort_values('datum_obj').drop(columns=['datum_obj'])
+        
+    return new_df
 
 # --- BOČNÍ PANEL (Vzhledová úprava) ---
 with st.sidebar:
