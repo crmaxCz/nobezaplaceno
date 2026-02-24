@@ -2,91 +2,91 @@ import streamlit as st
 import subprocess
 import pandas as pd
 import time
-from datetime import datetime, timedelta
 
-# 1. INSTALACE
+# 1. Instalace prohlížeče
 def install_playwright():
     if "browser_installed" not in st.session_state:
-        subprocess.run(["playwright", "install", "chromium"])
-        st.session_state["browser_installed"] = True
+        with st.spinner("Instalace jádra..."):
+            subprocess.run(["playwright", "install", "chromium"])
+            st.session_state["browser_installed"] = True
 
 install_playwright()
 from playwright.sync_api import sync_playwright
 
-# 2. CONFIG
-POBOCKY = {
-    "136": "Praha", "137": "Brno", "268": "Plzeň", "354": "Ostrava",
-    "133": "Olomouc", "277": "Hradec Králové", "326": "Liberec",
-    "387": "Pardubice", "151": "Nový Jičín", "321": "Frýdek - Místek",
-    "237": "Havířov", "203": "Opava", "215": "Trutnov", "400": "Zlín"
-}
+st.set_page_config(page_title="NOBE - Pouze Tabulka", layout="wide")
 
+# Přihlašovací údaje
 USER = st.secrets["moje_jmeno"]
 PW = st.secrets["moje_heslo"]
 
-st.set_page_config(page_title="NOBE - Seznam termínů", layout="wide")
-
-def get_data(pob_id):
-    results = []
-    # Dnešní datum pro filtr
-    dnes = datetime.now().strftime("%d.%m.%Y")
-    
+def scrape_simple_table(pob_id):
+    data = []
     with sync_playwright() as p:
+        # Spuštění prohlížeče
         browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
         context = browser.new_context()
         page = context.new_page()
-
-        # ZRYCHLENÍ: Blokujeme všechno kromě dokumentu
-        page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "style", "font", "script"] else route.continue_())
-
+        
         try:
-            # LOGIN
-            page.goto("https://nobe.moje-autoskola.cz/index.php")
+            # KROK 1: Login
+            st.write("🔑 Přihlašování...")
+            page.goto("https://nobe.moje-autoskola.cz/index.php", timeout=60000)
             page.fill('input[name="log_email"]', USER)
             page.fill('input[name="log_heslo"]', PW)
             page.click('input[type="submit"]')
-            time.sleep(3) # Počkáme na zpracování login
-
-            # FILTR (Tvůj odkaz)
-            url = f"https://nobe.moje-autoskola.cz/admin_prednasky.php?vytez_datum_od={dnes}&vytez_typ=545&vytez_lokalita={pob_id}&akce=prednasky_filtr"
-            st.write(f"Načítám: {url}")
             
-            # Jdeme na stránku, ale nečekáme na status "Hotovo"
-            page.goto(url, wait_until="commit") 
-            time.sleep(5) # Pevná pauza na vykreslení tabulky
+            # Počkáme 5 sekund na jistotu, že login proběhl
+            time.sleep(5)
 
-            # EXTRAKCE - Hledáme všechny řádky, které vypadají jako tvůj kód
+            # KROK 2: Přímý skok na tvoji URL
+            # Upravil jsem datum na 26.01.2026, jak jsi chtěl
+            target_url = f"https://nobe.moje-autoskola.cz/admin_prednasky.php?vytez_datum_od=26.01.2026&vytez_datum_do=&vytez_typ=545&vytez_ucitel=&vytez_lokalita={pob_id}&akce=prednasky_filtr"
+            st.write(f"🌐 Otevírám: {target_url}")
+            
+            # Jdeme na stránku a neřešíme, jestli se načetla celá (timeout ignorujeme)
+            try:
+                page.goto(target_url, timeout=60000)
+            except:
+                st.write("⚠️ Stránka se načítá pomalu, ale zkusím číst data...")
+
+            # Počkáme 5 sekund, aby se vygenerovalo HTML
+            time.sleep(5)
+
+            # KROK 3: Sebrat všechny řádky tabulky
+            # Najdeme všechny řádky <tr>, které v sobě mají odkaz na přednášku
             rows = page.query_selector_all("tr")
+            
             for row in rows:
-                if "admin_prednaska.php?edit_id=" in (row.inner_html() or ""):
+                inner_html = row.inner_html()
+                if "admin_prednaska.php?edit_id=" in inner_html:
                     cells = row.query_selector_all("td")
-                    if len(cells) >= 3:
-                        results.append({
+                    if len(cells) >= 5:
+                        data.append({
                             "Datum": cells[0].inner_text().strip(),
                             "Předmět": cells[1].inner_text().strip(),
                             "Učitel": cells[2].inner_text().strip(),
-                            "ID": cells[0].query_selector("a").get_attribute("href").split("=")[-1] if cells[0].query_selector("a") else "N/A"
+                            "Místo": cells[3].inner_text().strip()
                         })
+
         except Exception as e:
-            st.error(f"Chyba: {e}")
+            st.error(f"❌ Chyba: {e}")
         finally:
             browser.close()
-    return results
+    return data
 
-# --- UI ---
-st.title("Termíny přednášek NOBE")
+# --- JEDNODUCHÉ ROZHRANÍ ---
+st.title("Výpis přednášek z Moje Autoškola")
 
-with st.sidebar:
-    volba = st.selectbox("Pobočka:", list(POBOCKY.values()))
-    pob_id = [k for k, v in POBOCKY.items() if v == volba][0]
-    run = st.button("Ukaž termíny")
+# Seznam ID poboček (přidal jsem Liberec jako výchozí)
+pob_id = st.text_input("ID Lokality (např. 326 pro Liberec):", value="326")
 
-if run:
-    with st.spinner("Pracuji..."):
-        data = get_data(pob_id)
-        if data:
-            df = pd.DataFrame(data)
-            st.success(f"Nalezeno {len(df)} termínů.")
-            st.table(df)
+if st.button("STÁHNOUT TABULKU"):
+    with st.spinner("Stahuji data..."):
+        vysledek = scrape_simple_table(pob_id)
+        
+        if vysledek:
+            st.success(f"Nalezeno {len(vysledek)} záznamů.")
+            df = pd.DataFrame(vysledek)
+            st.dataframe(df, use_container_width=True)
         else:
-            st.warning("Nepodařilo se nic najít. Pravděpodobně timeout na straně serveru.")
+            st.warning("Tabulka nebyla nalezena. Buď je v daném období prázdná, nebo se stránka nenačetla včas.")
