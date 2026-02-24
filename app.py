@@ -47,8 +47,8 @@ def get_pobocka_data(pobocka_id, pobocka_nazev, username, password):
         
         # Přihlášení
         page.goto("https://nobe.moje-autoskola.cz/index.php")
-        page.fill('input[name="prihlasovaci_jmeno"]', username)
-        page.fill('input[name="heslo"]', password)
+        page.fill('input[name="log_email"]', username)  # Opraveno z prihlasovaci_jmeno
+        page.fill('input[name="log_heslo"]', password)  # Opraveno z heslo
         page.click('input[type="submit"]')
         page.wait_for_load_state("networkidle")
         
