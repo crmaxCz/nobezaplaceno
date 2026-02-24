@@ -1,86 +1,86 @@
 import streamlit as st
-import subprocess
+import requests
+from bs4 import BeautifulSoup
 import pandas as pd
-import time
+from datetime import datetime, timedelta
 
-# 1. Instalace Playwrightu (nutné pro Streamlit Cloud)
-def install_playwright():
-    if "browser_installed" not in st.session_state:
-        with st.spinner("Instalace prohlížeče..."):
-            subprocess.run(["playwright", "install", "chromium"])
-            st.session_state["browser_installed"] = True
+# Konfigurace stránky
+st.set_page_config(page_title="Dashboard Přednášek NOBE", layout="wide")
 
-install_playwright()
-from playwright.sync_api import sync_playwright
+# Definice poboček (ID: Název)
+BRANCHES = {
+    "136": "Praha", "137": "Brno", "268": "Plzeň", "354": "Ostrava",
+    "133": "Olomouc", "277": "Hradec Králové", "326": "Liberec",
+    "387": "Pardubice", "151": "Nový Jičín", "321": "Frýdek - Místek",
+    "237": "Havířov", "203": "Opava", "215": "Trutnov", "400": "Zlín"
+}
 
-st.set_page_config(page_title="NOBE Scraper", layout="wide")
+# Načtení přihlašovacích údajů ze Streamlit Secrets
+EMAIL = st.secrets["EMAIL"]
+PASSWORD = st.secrets["PASSWORD"]
 
-# Přihlašovací údaje z tvého nastavení Streamlit (Secrets)
-USER = st.secrets["moje_jmeno"]
-PW = st.secrets["moje_heslo"]
+def get_session():
+    """Vytvoří přihlášenou session."""
+    session = requests.Session()
+    login_url = "https://nobe.moje-autoskola.cz/index.php"
+    # Typické názvy polí pro tento systém, pokud by nefungovaly, je třeba je ověřit v HTML login formuláři
+    payload = {
+        "prihlasit_email": EMAIL,
+        "prihlasit_heslo": PASSWORD,
+        "akce": "prihlasit"
+    }
+    session.post(login_url, data=payload)
+    return session
 
-def get_simple_list():
-    data = []
-    with sync_playwright() as p:
-        # Spuštění prohlížeče v "lehkém" módu
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = browser.new_context()
-        page = context.new_page()
+@st.cache_data(ttl=3600) # Cache na 1 hodinu
+def fetch_lectures(branch_id):
+    """Scrapuje data pro konkrétní pobočku."""
+    date_from = datetime.now().strftime("%d.%m.%Y")
+    date_to = (datetime.now() + timedelta(days=90)).strftime("%d.%m.%Y")
+    
+    url = f"https://nobe.moje-autoskola.cz/admin_prednasky.php?vytez_datum_od={date_from}&vytez_datum_do={date_to}&vytez_typ=545&vytez_lokalita={branch_id}&akce=prednasky_filtr"
+    
+    session = get_session()
+    response = session.get(url)
+    
+    if response.status_code != 200:
+        return None
+
+    soup = BeautifulSoup(response.content, "html.parser")
+    table = soup.find("table", {"id": "tab-terminy"})
+    
+    lectures = []
+    
+    if table:
+        rows = table.find_all("tr")[1:]  # Přeskočit hlavičku
+        for row in rows:
+            cols = row.find_all("td")
+            if len(cols) > 0:
+                # Datum a čas jsou obvykle v prvním sloupci v tagu <a>
+                date_time_text = cols[0].get_text(strip=True)
+                lectures.append({"Datum a čas": date_time_text})
+    
+    return pd.DataFrame(lectures)
+
+# UI - Sidebar
+st.sidebar.header("Nastavení")
+selected_city = st.sidebar.selectbox("Vyberte pobočku", options=list(BRANCHES.values()))
+# Získání ID podle vybraného města
+selected_id = [id for id, name in BRANCHES.items() if name == selected_city][0]
+
+load_button = st.sidebar.button("Načíst / Obnovit data")
+
+# Hlavní panel
+st.title(f"Přednášky - {selected_city}")
+
+if load_button:
+    with st.spinner('Stahuji data...'):
+        df = fetch_lectures(selected_id)
         
-        try:
-            # KROK 1: Přihlášení
-            st.info("Probíhá přihlášení...")
-            page.goto("https://nobe.moje-autoskola.cz/index.php")
-            page.fill('input[name="log_email"]', USER)
-            page.fill('input[name="log_heslo"]', PW)
-            page.click('input[type="submit"]')
-            
-            # Počkáme 5 sekund, než systém zpracuje login
-            time.sleep(5)
-
-            # KROK 2: Skok přímo na tvou cílovou URL
-            target_url = "https://nobe.moje-autoskola.cz/admin_prednasky.php?vytez_datum_od=26.01.2026&vytez_datum_do=&vytez_typ=545&vytez_ucitel=&vytez_lokalita=326&akce=prednasky_filtr"
-            st.info(f"Otevírám seznam termínů...")
-            
-            # Jdeme na stránku, timeout nastavíme na 60s
-            page.goto(target_url, timeout=60000)
-            
-            # Počkáme 5 sekund na vykreslení tabulky
-            time.sleep(5)
-
-            # KROK 3: Sběr dat z tabulky
-            # Najdeme všechny řádky tabulky <tr>
-            rows = page.query_selector_all("tr")
-            
-            for row in rows:
-                inner_text = row.inner_text()
-                # Hledáme pouze řádky, které obsahují odkaz na detail přednášky
-                if "admin_prednaska.php?edit_id=" in (row.inner_html() or ""):
-                    cells = row.query_selector_all("td")
-                    if len(cells) >= 3:
-                        data.append({
-                            "Datum a čas": cells[0].inner_text().strip(),
-                            "Název": cells[1].inner_text().strip(),
-                            "Lektor": cells[2].inner_text().strip(),
-                            "Lokalita": cells[3].inner_text().strip() if len(cells) > 3 else "Liberec"
-                        })
-
-        except Exception as e:
-            st.error(f"Chyba při scrapování: {e}")
-        finally:
-            browser.close()
-    return data
-
-# --- JEDNODUCHÉ UI ---
-st.title("Seznam přednášek - Liberec")
-
-if st.button("STÁHNOUT DATA"):
-    with st.spinner("Pracuji na tom..."):
-        vysledek = get_simple_list()
-        
-        if vysledek:
-            st.success(f"Nalezeno {len(vysledek)} termínů.")
-            df = pd.DataFrame(vysledek)
-            st.table(df)
+        if df is not None and not df.empty:
+            st.success(f"Nalezeno {len(df)} termínů na příští 3 měsíce.")
+            st.table(df) # Zobrazení statické tabulky (jednodušší) nebo st.dataframe(df)
         else:
-            st.warning("Žádná data nebyla nalezena. Ověřte, zda jsou pro toto období v systému vypsané přednášky.")
+            st.info("Pro tuto pobočku nebyly v daném období nalezeny žádné přednášky.")
+else:
+    st.write("Vyberte pobočku v levém panelu a klikněte na tlačítko pro načtení dat.")
