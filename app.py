@@ -4,16 +4,24 @@ import os
 import pandas as pd
 import re
 
-# --- INSTALACE (ponecháme pro jistotu) ---
-try:
-    from playwright.sync_api import sync_playwright
-except ImportError:
-    subprocess.run(["pip", "install", "playwright"])
-    from playwright.sync_api import sync_playwright
+# Funkce pro instalaci prohlížeče, pokud chybí
+def install_playwright_browser():
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        # Pokud by náhodou knihovna chyběla v prostředí
+        subprocess.run(["pip", "install", "playwright"])
+        from playwright.sync_api import sync_playwright
+    
+    # Instalace samotného prohlížeče Chromium
+    # Provádíme pouze jednou za restart aplikace
+    if "browser_installed" not in st.session_state:
+        subprocess.run(["playwright", "install", "chromium"])
+        st.session_state["browser_installed"] = True
 
-if "playwright_installed" not in st.session_state:
-    os.system("playwright install chromium")
-    st.session_state["playwright_installed"] = True
+# Spustíme instalaci hned na začátku
+install_playwright_browser()
+from playwright.sync_api import sync_playwright
 
 # --- KONFIGURACE ---
 POBOCKY = {
