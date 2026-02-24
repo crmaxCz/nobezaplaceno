@@ -3,39 +3,132 @@ import pandas as pd
 from playwright.sync_api import sync_playwright
 import re
 
-st.set_page_config(page_title="NOBE Zaplaceno", layout="wide")
+# Tvůj přesný seznam poboček v požadovaném pořadí
+POBOCKY = {
+    "136": "Praha",
+    "137": "Brno",
+    "268": "Plzeň",
+    "354": "Ostrava",
+    "133": "Olomouc",
+    "277": "Hradec Králové",
+    "326": "Liberec",
+    "387": "Pardubice",
+    "151": "Nový Jičín",
+    "321": "Frýdek - Místek",
+    "237": "Havířov",
+    "203": "Opava",
+    "215": "Trutnov",
+    "400": "Zlín"
+}
 
-def get_data(user, password):
+st.set_page_config(page_title="AŠ NOBE Statistiky", layout="wide")
+
+st.title("📊 Dashboard obsazenosti a plateb NOBE")
+
+# --- FUNKCE PRO SCRAPING ---
+def scrape_data(username, password, selected_pobocky_ids):
+    data_list = []
+    
     with sync_playwright() as p:
+        # Instalace prohlížeče přímo v rámci běhu (nutné pro Streamlit Cloud)
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
-        
+
         # Přihlášení
-        page.goto("https://nobe.moje-autoskola.cz/")
-        page.fill('input[name="prihlasovaci_jmeno"]', user)
-        page.fill('input[name="heslo"]', password)
-        page.click('button[type="submit"]')
+        try:
+            page.goto("https://nobe.moje-autoskola.cz/index.php", timeout=60000)
+            page.fill('input[name="prihlasovaci_jmeno"]', username)
+            page.fill('input[name="heslo"]', password)
+            page.click('input[type="submit"]')
+            page.wait_for_load_state("networkidle")
+            
+            for pid in selected_pobocky_ids:
+                nazev_pobocky = POBOCKY[pid]
+                st.info(f"Stahuji data pro: {nazev_pobocky}...")
+                
+                # Načtení seznamu termínů pro pobočku
+                url_seznam = f"https://nobe.moje-autoskola.cz/admin_prednasky.php?vytez_datum_od=01.01.2024&vytez_typ=545&vytez_lokalita={pid}&akce=prednasky_filtr"
+                page.goto(url_seznam)
+                
+                # Najdeme všechny odkazy na detaily (edit_id)
+                links = page.query_selector_all("a[href*='admin_prednaska.php?edit_id=']")
+                urls = list(set([l.get_attribute("href") for l in links]))
+                
+                for detail_url in urls:
+                    page.goto(f"https://nobe.moje-autoskola.cz/{detail_url}")
+                    
+                    # Získání názvu/data z nadpisu
+                    termin_name = page.inner_text("h1").replace("Přednáška - ", "")
+                    
+                    # Analýza tabulky žáků
+                    rows = page.query_selector_all("#table_seznam_zaku tr")
+                    
+                    prihlaseno = 0
+                    uhrazeno = 0
+                    
+                    for row in rows:
+                        cells = row.query_selector_all("td")
+                        if len(cells) > 5:
+                            prihlaseno += 1
+                            platba_text = cells[5].inner_text()
+                            # Logika: pokud je tam cokoliv před "z", považujeme za uhrazeno
+                            if re.search(r'\d.*z', platba_text):
+                                uhrazeno += 1
+                    
+                    data_list.append({
+                        "Pobočka": nazev_pobocky,
+                        "Termín": termin_name,
+                        "Přihlášeno": prihlaseno,
+                        "Uhrazeno": uhrazeno
+                    })
+        except Exception as e:
+            st.error(f"Chyba při scrapování: {e}")
         
-        # Zde robot projde seznam přednášek a posbírá data
-        # Pro každou přednášku analyzuje tabulku #table_seznam_zaku
-        # Logika: pokud sloupec 'Uhrazeno' obsahuje číslo před 'z', je zaplaceno
-        
-        # ... (zde bude kompletní kód scraperu) ...
-        
-        return pd.DataFrame(data_list)
+        browser.close()
+    return pd.DataFrame(data_list)
 
-st.title("📊 Statistiky obsazenosti a plateb")
-
-# Boční panel pro nastavení
+# --- BOČNÍ PANEL ---
 with st.sidebar:
-    user = st.text_input("Přihlašovací jméno")
+    st.header("Nastavení")
+    user = st.text_input("Uživatelské jméno")
     pw = st.text_input("Heslo", type="password")
-    if st.button("Aktualizovat data"):
-        df = get_data(user, pw)
-        st.session_state['data'] = df
+    
+    st.subheader("Výběr poboček")
+    # Multi-select zachovávající tvoje pořadí
+    selected_names = st.multiselect("Vyber pobočky k analýze", options=list(POBOCKY.values()), default=list(POBOCKY.values()))
+    
+    # Převod jmen zpět na ID
+    selected_ids = [k for k, v in POBOCKY.items() if v in selected_names]
 
-# Zobrazení grafů (pokud máme data)
+    run_btn = st.button("🚀 Aktualizovat statistiky")
+
+# --- HLAVNÍ PLOCHA ---
+if run_btn:
+    if not user or not pw:
+        st.warning("Zadejte prosím přihlašovací údaje.")
+    else:
+        results_df = scrape_data(user, pw, selected_ids)
+        if not results_df.empty:
+            st.session_state['data'] = results_df
+            st.success("Data byla úspěšně načtena!")
+
 if 'data' in st.session_state:
     df = st.session_state['data']
-    # Tady se vykreslí grafy podle poboček
-    st.bar_chart(df, x="Pobočka", y=["Celkem", "Zaplaceno"])
+    
+    # Výpočty
+    df['Neuhrazeno'] = df['Přihlášeno'] - df['Uhrazeno']
+    df['% Uhrazeno'] = (df['Uhrazeno'] / df['Přihlášeno'] * 100).round(1)
+
+    # Celkové statistiky v kartách
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Celkem přihlášeno", df['Přihlášeno'].sum())
+    c2.metric("Celkem uhrazeno", df['Uhrazeno'].sum())
+    c3.metric("Průměrná úhrada", f"{df['% Uhrazeno'].mean().round(1)} %")
+
+    # Grafy
+    st.subheader("Vizualizace termínů")
+    st.bar_chart(df, x="Termín", y=["Uhrazeno", "Neuhrazeno"])
+    
+    # Detailní tabulka
+    st.subheader("Detailní data")
+    st.dataframe(df.sort_values(by="Pobočka"), use_container_width=True)
