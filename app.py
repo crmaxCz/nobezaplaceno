@@ -3,6 +3,7 @@ import subprocess
 import os
 import pandas as pd
 import re
+from datetime import datetime
 
 # Funkce pro instalaci prohlížeče, pokud chybí
 def install_playwright_browser():
@@ -38,53 +39,78 @@ USER = st.secrets["moje_jmeno"]
 PW = st.secrets["moje_heslo"]
 
 # --- FUNKCE S CACHE ---
-@st.cache_data(show_spinner="Stahuji čerstvá data z autoškoly...", ttl=3600) # cache platí 1 hodinu
+@st.cache_data(show_spinner="Analyzuji termíny...", ttl=3600)
 def get_pobocka_data(pobocka_id, pobocka_nazev, username, password):
     data_list = []
+    # Dnešní datum pro filtr v URL
+    dnes = datetime.now().strftime("%d.%m.%Y")
+    
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         
         # Přihlášení
         page.goto("https://nobe.moje-autoskola.cz/index.php")
-        page.fill('input[name="log_email"]', username)  # Opraveno z prihlasovaci_jmeno
-        page.fill('input[name="log_heslo"]', password)  # Opraveno z heslo
+        page.fill('input[name="log_email"]', username)
+        page.fill('input[name="log_heslo"]', password)
         page.click('input[type="submit"]')
         page.wait_for_load_state("networkidle")
         
-        # Načtení seznamu termínů
-        url_seznam = f"https://nobe.moje-autoskola.cz/admin_prednasky.php?vytez_datum_od=01.01.2024&vytez_typ=545&vytez_lokalita={pobocka_id}&akce=prednasky_filtr"
+        # URL upravená tak, aby brala data od DNES
+        url_seznam = f"https://nobe.moje-autoskola.cz/admin_prednasky.php?vytez_datum_od={dnes}&vytez_typ=545&vytez_lokalita={pobocka_id}&akce=prednasky_filtr"
         page.goto(url_seznam)
         
         links = page.query_selector_all("a[href*='admin_prednaska.php?edit_id=']")
-        urls = list(set([l.get_attribute("href") for l in links]))[:10] # Omezíme na prvních 10 pro test rychlosti
+        urls = list(set([l.get_attribute("href") for l in links]))
         
         for detail_url in urls:
             page.goto(f"https://nobe.moje-autoskola.cz/{detail_url}")
             try:
-                # Získání názvu/data (předpokládáme h1)
-                termin_name = page.inner_text("h1").replace("Přednáška - ", "")
-                rows = page.query_selector_all("#table_seznam_zaku tr")
+                # Získání názvu termínu
+                termin_name = page.inner_text("h1").replace("Přednáška - ", "").strip()
                 
+                rows = page.query_selector_all("#table_seznam_zaku tr")
                 prihlaseno = 0
                 uhrazeno = 0
+                
                 for row in rows:
                     cells = row.query_selector_all("td")
                     if len(cells) > 5:
                         prihlaseno += 1
-                        if re.search(r'\d.*z', cells[5].inner_text()):
-                            uhrazeno += 1
+                        text_bunky = cells[5].inner_text().strip()
+                        
+                        # NOVÁ LOGIKA: Hledáme jakékoliv číslo, po kterém následuje mezera a "Kč"
+                        # Pokud tam je např "15 000,- Kč z 20 000", vezme to 15000
+                        # Pokud tam je jen "z 20 000", nenajde to nic před tím
+                        castka_match = re.search(r'^([\d\s]+),-', text_bunky)
+                        if castka_match:
+                            nalezena_castka = castka_match.group(1).replace(" ", "")
+                            if int(nalezena_castka) > 0:
+                                uhrazeno += 1
                 
-                data_list.append({
-                    "Termín": termin_name,
-                    "Přihlášeno": prihlaseno,
-                    "Uhrazeno": uhrazeno
-                })
-            except:
+                if prihlaseno > 0:
+                    data_list.append({
+                        "Termín": termin_name,
+                        "Přihlášeno": prihlaseno,
+                        "Uhrazeno": uhrazeno
+                    })
+            except Exception as e:
                 continue
                 
         browser.close()
-    return pd.DataFrame(data_list)
+    
+    # Seřadíme data podle termínu, aby graf dával smysl
+    new_df = pd.DataFrame(data_list)
+    if not new_df.empty:
+        # Pokusíme se převést text na skutečné datum pro správné řazení
+        try:
+            # Předpokládáme formát "5.3.2026 (16:15)" -> vezmeme jen datum
+            new_df['datum_obj'] = pd.to_datetime(new_df['Termín'].str.split(' ').str[0], dayfirst=True)
+            new_df = new_df.sort_values('datum_obj').drop(columns=['datum_obj'])
+        except:
+            pass
+            
+    return new_df
 
 # --- BOČNÍ PANEL (Vzhledová úprava) ---
 with st.sidebar:
