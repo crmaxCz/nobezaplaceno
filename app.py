@@ -1,11 +1,23 @@
 import streamlit as st
-import pandas as pd
-from playwright.sync_api import sync_playwright
-import re
+import subprocess
 import os
 
-# Tento příkaz vynutí instalaci prohlížeče Chromium přímo na serveru Streamlitu
-os.system("playwright install chromium")
+# 1. Oprava instalace: Musíme nejdřív zkusit importovat, a když to nejde, tak doinstalovat.
+try:
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    # Pokud knihovna chybí, nainstalujeme ji (to se stane při prvním spuštění)
+    subprocess.run(["pip", "install", "playwright"])
+    from playwright.sync_api import sync_playwright
+
+# 2. Instalace prohlížeče Chromium (pokud ještě není)
+# Toto spustíme jen jednou při startu aplikace
+if "playwright_installed" not in st.session_state:
+    os.system("playwright install chromium")
+    st.session_state["playwright_installed"] = True
+
+import pandas as pd
+import re
 
 # Tvůj přesný seznam poboček v požadovaném pořadí
 POBOCKY = {
