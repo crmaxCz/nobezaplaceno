@@ -104,19 +104,18 @@ def scrape_data(username, password, selected_pobocky_ids):
     return pd.DataFrame(data_list)
 
 # --- BOČNÍ PANEL ---
+user = st.secrets["moje_jmeno"]
+pw = st.secrets["moje_heslo"]
+
 with st.sidebar:
-    st.header("Nastavení")
-    user = st.text_input("Uživatelské jméno")
-    pw = st.text_input("Heslo", type="password")
+    st.header("Ovládání")
+    st.info(f"Přihlášen jako: {user}") # Jen pro info, že to funguje
     
     st.subheader("Výběr poboček")
-    # Multi-select zachovávající tvoje pořadí
-    selected_names = st.multiselect("Vyber pobočky k analýze", options=list(POBOCKY.values()), default=list(POBOCKY.values()))
-    
-    # Převod jmen zpět na ID
+    selected_names = st.multiselect("Vyber pobočky", options=list(POBOCKY.values()), default=list(POBOCKY.values()))
     selected_ids = [k for k, v in POBOCKY.items() if v in selected_names]
 
-    run_btn = st.button("🚀 Aktualizovat statistiky")
+    run_btn = st.button("🚀 Spustit aktualizaci")
 
 # --- HLAVNÍ PLOCHA ---
 if run_btn:
