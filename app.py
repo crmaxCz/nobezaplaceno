@@ -1,20 +1,15 @@
 import streamlit as st
 import subprocess
-import os
 import pandas as pd
 import re
 from datetime import datetime, timedelta
 
-# --- 1. INSTALACE PROHLÍŽEČE ---
+# --- 1. INSTALACE ---
 def install_playwright_browser():
     if "browser_installed" not in st.session_state:
-        with st.spinner("Příprava systému (instalace Chromia)..."):
-            try:
-                # Instalace binárek pro Streamlit Cloud
-                subprocess.run(["playwright", "install", "chromium"], check=True)
-                st.session_state["browser_installed"] = True
-            except Exception as e:
-                st.error(f"Instalace prohlížeče selhala: {e}")
+        with st.spinner("Instalace prohlížeče..."):
+            subprocess.run(["playwright", "install", "chromium"])
+            st.session_state["browser_installed"] = True
 
 install_playwright_browser()
 from playwright.sync_api import sync_playwright
@@ -27,66 +22,64 @@ POBOCKY = {
     "237": "Havířov", "203": "Opava", "215": "Trutnov", "400": "Zlín"
 }
 
-st.set_page_config(page_title="AŠ NOBE Statistiky", layout="wide")
+st.set_page_config(page_title="NOBE Zaplaceno", layout="wide")
 
-# Načtení tajných údajů
-try:
-    USER = st.secrets["moje_jmeno"]
-    PW = st.secrets["moje_heslo"]
-except KeyError:
-    st.error("Chybí přihlašovací údaje v Streamlit Secrets!")
-    st.stop()
+USER = st.secrets["moje_jmeno"]
+PW = st.secrets["moje_heslo"]
 
 # --- 3. SCRAPER ---
 def get_pobocka_data(pobocka_id, pobocka_nazev, username, password):
     data_list = []
+    # Filtr na 3 měsíce dopředu
     dnes = datetime.now().strftime("%d.%m.%Y")
     budoucno = (datetime.now() + timedelta(days=90)).strftime("%d.%m.%Y")
     
     with sync_playwright() as p:
-        # Spuštění s parametry pro stabilitu na cloudu
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
-        context = browser.new_context(viewport={'width': 1280, 'height': 800})
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        context = browser.new_context()
         page = context.new_page()
 
-        # Zrychlení: Blokování nepodstatných souborů
-        page.route("**/*.{png,jpg,jpeg,svg,css,woff,woff2}", lambda route: route.abort())
-
         try:
-            # A. PŘIHLÁŠENÍ
-            page.goto("https://nobe.moje-autoskola.cz/index.php", timeout=60000)
+            # A. LOGIN
+            page.goto("https://nobe.moje-autoskola.cz/index.php")
             page.fill('input[name="log_email"]', username)
             page.fill('input[name="log_heslo"]', password)
             page.click('input[type="submit"]')
-            
-            # Počkáme, až budeme uvnitř
-            page.wait_for_url("**/index.php*", timeout=20000)
+            page.wait_for_url("**/index.php*")
 
-            # B. FILTR TERMÍNŮ
+            # B. SEZNAM (podle tvého HTML)
             url_seznam = f"https://nobe.moje-autoskola.cz/admin_prednasky.php?vytez_datum_od={dnes}&vytez_datum_do={budoucno}&vytez_typ=545&vytez_lokalita={pobocka_id}&akce=prednasky_filtr"
-            page.goto(url_seznam, wait_until="domcontentloaded")
+            page.goto(url_seznam, wait_until="networkidle")
             
-            # Sběr odkazů na detaily přednášek
-            links = page.query_selector_all("a[href*='admin_prednaska.php?edit_id=']")
-            urls = list(set([l.get_attribute("href") for l in links]))
+            # Hledáme odkazy přesně podle tvého HTML (tr.text-warning td a)
+            links = page.query_selector_all("tr.text-warning td a[href*='admin_prednaska.php?edit_id=']")
+            
+            # Vyčištění URL (přidání domény) a unikátnost
+            urls = []
+            for l in links:
+                href = l.get_attribute("href")
+                if href:
+                    full_url = "https://nobe.moje-autoskola.cz" + (href if href.startswith("/") else "/" + href)
+                    if full_url not in urls:
+                        urls.append(full_url)
 
             if not urls:
+                st.warning(f"Na pobočce {pobocka_nazev} nebyly v seznamu nalezeny žádné budoucí přednášky.")
                 return pd.DataFrame()
 
-            # C. ANALÝZA JEDNOTLIVÝCH TERMÍNŮ
-            status_placeholder = st.empty()
-            progress_bar = st.progress(0)
+            # C. SBĚR DAT Z DETAILŮ
+            status = st.empty()
+            bar = st.progress(0)
 
-            for i, detail_url in enumerate(urls[:20]): # Limit pro stabilitu
-                full_url = f"https://nobe.moje-autoskola.cz/{detail_url}" if "http" not in detail_url else detail_url
-                page.goto(full_url, wait_until="domcontentloaded")
+            for i, detail_url in enumerate(urls[:20]): # Limit 20 termínů pro rychlost
+                page.goto(detail_url, wait_until="domcontentloaded")
                 
                 try:
-                    # Název přednášky
-                    termin_name = page.inner_text("h1", timeout=5000).replace("Přednáška - ", "").strip()
-                    status_placeholder.text(f"Analyzuji: {termin_name}")
+                    # Název z H1
+                    title = page.inner_text("h1").replace("Přednáška - ", "").strip()
+                    status.text(f"Analyzuji: {title}")
 
-                    # Tabulka s třídou, kterou jsi zjistil
+                    # Tabulka žáků (podle tvého elementu table.table-striped)
                     table = page.query_selector("table.table-striped")
                     if table:
                         rows = table.query_selector_all("tbody tr")
@@ -95,80 +88,56 @@ def get_pobocka_data(pobocka_id, pobocka_nazev, username, password):
                         
                         for row in rows:
                             cells = row.query_selector_all("td")
-                            # Kontrola: řádek žáka musí mít aspoň 5 buněk a nesmí to být suma ∑
-                            if len(cells) >= 5:
-                                row_text = row.inner_text()
-                                if "∑" in row_text:
-                                    continue
-                                
+                            # Musí to být řádek žáka (aspoň 5 buněk) a nesmí to být suma ∑
+                            if len(cells) >= 5 and "∑" not in row.inner_text():
                                 prihlaseno += 1
-                                # 5. sloupec (index 4) - Uhrazeno
-                                payment_text = cells[4].inner_text().strip()
-                                
-                                # Čištění: bereme část před "z", odstraníme mezery a Kč
-                                if 'z' in payment_text:
-                                    paid_part = payment_text.split('z')[0]
-                                    clean_value = re.sub(r'\D', '', paid_part)
-                                    if clean_value and int(clean_value) > 0:
-                                        uhrazeno += 1
+                                # 5. sloupec (index 4) je Uhrazeno
+                                pay_txt = cells[4].inner_text().split('z')[0]
+                                clean_val = "".join(filter(str.isdigit, pay_txt))
+                                if clean_val and int(clean_val) > 0:
+                                    uhrazeno += 1
                         
                         if prihlaseno > 0:
-                            data_list.append({
-                                "Termín": termin_name,
-                                "Přihlášeno": prihlaseno,
-                                "Uhrazeno": uhrazeno
-                            })
+                            data_list.append({"Termín": title, "Přihlášeno": prihlaseno, "Uhrazeno": uhrazeno})
                 except:
                     continue
-                progress_bar.progress((i + 1) / len(urls[:20]))
+                bar.progress((i + 1) / len(urls[:20]))
 
-            status_placeholder.empty()
-            progress_bar.empty()
+            status.empty()
+            bar.empty()
 
         except Exception as e:
-            st.error(f"Chyba při scrapování: {e}")
+            st.error(f"Chyba: {e}")
         finally:
             browser.close()
 
     return pd.DataFrame(data_list)
 
-# --- 4. DASHBOARD UI ---
-with st.sidebar:
-    st.image("https://www.nobe.cz/wp-content/uploads/2021/03/logo-nobe-autoskola.png", width=150)
-    st.header("📍 Výběr pobočky")
-    vybrana_pobocka_nazev = st.radio("Zobrazit data pro:", options=list(POBOCKY.values()))
-    vybrana_pobocka_id = [k for k, v in POBOCKY.items() if v == vybrana_pobocka_nazev][0]
-    
-    st.divider()
-    if st.button("🔄 Aktualizovat data"):
-        st.cache_data.clear()
-        st.rerun()
+# --- 4. UI DASHBOARD ---
+st.sidebar.header("📍 Pobočka")
+pobocka_name = st.sidebar.selectbox("Vyberte:", list(POBOCKY.values()))
+pobocka_id = [k for k, v in POBOCKY.items() if v == pobocka_name][0]
 
-st.title(f"Statistiky plateb – {vybrana_pobocka_nazev}")
+if st.sidebar.button("🔄 Načíst nová data"):
+    st.cache_data.clear()
 
-# Volání funkce s cache
+st.title(f"Přehled plateb: {pobocka_name}")
+
+# Cache na 15 minut
 @st.cache_data(ttl=900)
-def cached_data(p_id, p_name, u, p):
-    return get_pobocka_data(p_id, p_name, u, p)
+def load_data(pid, pname, u, p):
+    return get_pobocka_data(pid, pname, u, p)
 
-df = cached_data(vybrana_pobocka_id, vybrana_pobocka_nazev, USER, PW)
+df = load_data(pobocka_id, pobocka_name, USER, PW)
 
 if not df.empty:
-    # Výpočty
     df['Neuhrazeno'] = df['Přihlášeno'] - df['Uhrazeno']
     
-    # Metriky
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Celkem termínů", len(df))
-    m2.metric("Přihlášeno celkem", df['Přihlášeno'].sum())
-    m3.metric("Uhrazeno celkem", df['Uhrazeno'].sum())
-
-    # Graf
-    st.subheader("Vizualizace obsazenosti a plateb")
+    c1, c2 = st.columns(2)
+    c1.metric("Celkem přihlášených", df['Přihlášeno'].sum())
+    c2.metric("Celkem zaplaceno", df['Uhrazeno'].sum())
+    
     st.bar_chart(df.set_index("Termín")[["Uhrazeno", "Neuhrazeno"]])
-
-    # Tabulka
-    st.subheader("Detailní přehled")
     st.dataframe(df, use_container_width=True)
 else:
-    st.info("Pro vybranou pobočku nebyla nalezena žádná data o budoucích přednáškách.")
+    st.info("Žádná data k zobrazení. Zkuste jinou pobočku nebo obnovit data.")
