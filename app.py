@@ -39,59 +39,54 @@ USER = st.secrets["moje_jmeno"]
 PW = st.secrets["moje_heslo"]
 
 # --- FUNKCE S CACHE ---
-@st.cache_data(show_spinner="Navazuji spojení se systémem...", ttl=600)
+@st.cache_data(show_spinner="Přihlašuji se a stahuji data...", ttl=600)
 def get_pobocka_data(pobocka_id, pobocka_nazev, username, password):
     data_list = []
     dnes = datetime.now().strftime("%d.%m.%Y")
     budoucno = (datetime.now() + timedelta(days=90)).strftime("%d.%m.%Y")
     
     with sync_playwright() as p:
-        # Spustíme prohlížeč s parametry pro vyšší stabilitu
+        # Spuštění prohlížeče s parametry pro stabilitu
         browser = p.chromium.launch(headless=True, args=["--disable-gpu", "--no-sandbox"])
-        context = browser.new_context(viewport={'width': 1280, 'height': 800})
+        # Vytvoříme kontext (v něm žijí cookies o přihlášení)
+        context = browser.new_context()
         page = context.new_page()
 
-        # ZRYCHLENÍ: Blokujeme stahování obrázků a stylů
-        page.route("**/*.{png,jpg,jpeg,svg,css,woff,woff2}", lambda route: route.abort())
-
         try:
-            # 1. LOGIN - Jdeme přímo na login
+            # KROK 1: Přihlášení (uděláme jen jednou)
             page.goto("https://nobe.moje-autoskola.cz/index.php", timeout=60000)
             page.fill('input[name="log_email"]', username)
             page.fill('input[name="log_heslo"]', password)
-            
-            # Klikneme a počkáme na změnu URL (přihlášení)
             page.click('input[type="submit"]')
-            page.wait_for_url("**/index.php*", timeout=15000) 
-
-            # 2. FILTR - Jdeme přímo na URL s filtrem
-            url_seznam = f"https://nobe.moje-autoskola.cz/admin_prednasky.php?vytez_datum_od={dnes}&vytez_datum_do={budoucno}&vytez_typ=545&vytez_lokalita={pobocka_id}&akce=prednasky_filtr"
             
-            # Nečekáme na 'load', ale jen na 'domcontentloaded' (stačí nám texty)
+            # Počkáme, až se objevíme na hlavní ploše (potvrzení loginu)
+            page.wait_for_url("**/index.php*", timeout=20000)
+
+            # KROK 2: Skok na filtrovaný seznam (už jako přihlášený uživatel)
+            url_seznam = f"https://nobe.moje-autoskola.cz/admin_prednasky.php?vytez_datum_od={dnes}&vytez_datum_do={budoucno}&vytez_typ=545&vytez_lokalita={pobocka_id}&akce=prednasky_filtr"
             page.goto(url_seznam, wait_until="domcontentloaded", timeout=45000)
             
-            # Krátká pauza na JS tabulky
-            page.wait_for_timeout(3000)
-
-            # 3. SBĚR ODKAZŮ
+            # Najdeme odkazy na detaily (edit_id)
             links = page.query_selector_all("a[href*='admin_prednaska.php?edit_id=']")
             urls = list(set([l.get_attribute("href") for l in links]))
-            
+
             if not urls:
-                # Pokud nic nenajde, vypíšeme co robot vidí (pro nás k ladění)
-                obsah = page.inner_text("body")[:200].replace("\n", " ")
-                st.warning(f"Na pobočce {pobocka_nazev} nejsou termíny. Robot vidí: {obsah}")
+                # Malý trik: Pokud robot nic nevidí, vypíšeme mu text stránky pro kontrolu
+                debug_text = page.inner_text("body")[:150].replace("\n", " ")
+                st.warning(f"Pobočka {pobocka_nazev}: Žádné termíny. (Robot vidí: {debug_text})")
                 return pd.DataFrame()
 
-            # Limitujeme na prvních 15 termínů, aby to Streamlit neusekl kvůli času
-            for detail_url in urls[:15]:
+            # KROK 3: Procházení detailů (velmi rychlé díky existující session)
+            for detail_url in urls[:15]: # Omezení na 15 pro rychlost
                 full_url = f"https://nobe.moje-autoskola.cz/{detail_url}" if "http" not in detail_url else detail_url
-                page.goto(full_url, wait_until="domcontentloaded")
+                page.goto(full_url, wait_until="domcontentloaded", timeout=20000)
                 
                 try:
+                    # Název z H1
                     termin_name = page.inner_text("h1", timeout=5000).replace("Přednáška - ", "").strip()
-                    rows = page.query_selector_all("#table_seznam_zaku tr")
                     
+                    # Analýza tabulky žáků
+                    rows = page.query_selector_all("#table_seznam_zaku tr")
                     prihlaseno = 0
                     uhrazeno = 0
                     
@@ -100,9 +95,10 @@ def get_pobocka_data(pobocka_id, pobocka_nazev, username, password):
                         if len(cells) >= 6:
                             prihlaseno += 1
                             txt = cells[5].inner_text().split('z')[0]
-                            if any(char.isdigit() for char in txt):
-                                num = int(re.sub(r'\D', '', txt))
-                                if num > 0: uhrazeno += 1
+                            # Vyfiltrujeme jen číslice
+                            num_str = "".join(filter(str.isdigit, txt))
+                            if num_str and int(num_str) > 0:
+                                uhrazeno += 1
                     
                     if prihlaseno > 0:
                         data_list.append({"Termín": termin_name, "Přihlášeno": prihlaseno, "Uhrazeno": uhrazeno})
@@ -110,15 +106,18 @@ def get_pobocka_data(pobocka_id, pobocka_nazev, username, password):
                     continue
 
         except Exception as e:
-            st.error(f"Technický problém: {str(e)}")
+            st.error(f"Chyba při komunikaci: {str(e)}")
         finally:
             browser.close()
 
+    # Zpracování dat do tabulky
     df = pd.DataFrame(data_list)
     if not df.empty:
+        # Převedeme na datum pro řazení
         df['datum_obj'] = pd.to_datetime(df['Termín'].str.split(' ').str[0], dayfirst=True, errors='coerce')
         df = df.sort_values('datum_obj').drop(columns=['datum_obj'])
     return df
+    
 # --- BOČNÍ PANEL (Vzhledová úprava) ---
 with st.sidebar:
     st.header("📍 Pobočky")
