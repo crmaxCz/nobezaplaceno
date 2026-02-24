@@ -42,21 +42,19 @@ PW = st.secrets["moje_heslo"]
 @st.cache_data(show_spinner="Analyzuji termíny...", ttl=3600)
 def get_pobocka_data(pobocka_id, pobocka_nazev, username, password):
     data_list = []
-    # Dnešní datum pro filtr v URL
     dnes = datetime.now().strftime("%d.%m.%Y")
     
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         
-        # Přihlášení
+        # Přihlášení (používáme tvoje zjištěné názvy polí)
         page.goto("https://nobe.moje-autoskola.cz/index.php")
         page.fill('input[name="log_email"]', username)
         page.fill('input[name="log_heslo"]', password)
         page.click('input[type="submit"]')
         page.wait_for_load_state("networkidle")
         
-        # URL upravená tak, aby brala data od DNES
         url_seznam = f"https://nobe.moje-autoskola.cz/admin_prednasky.php?vytez_datum_od={dnes}&vytez_typ=545&vytez_lokalita={pobocka_id}&akce=prednasky_filtr"
         page.goto(url_seznam)
         
@@ -66,51 +64,53 @@ def get_pobocka_data(pobocka_id, pobocka_nazev, username, password):
         for detail_url in urls:
             page.goto(f"https://nobe.moje-autoskola.cz/{detail_url}")
             try:
-                # Získání názvu termínu
                 termin_name = page.inner_text("h1").replace("Přednáška - ", "").strip()
-                
                 rows = page.query_selector_all("#table_seznam_zaku tr")
+                
                 prihlaseno = 0
                 uhrazeno = 0
+                raw_values = []
                 
                 for row in rows:
                     cells = row.query_selector_all("td")
                     if len(cells) > 5:
                         prihlaseno += 1
-                        text_bunky = cells[5].inner_text().strip()
+                        text_uhrazeno = cells[5].inner_text().strip()
+                        raw_values.append(text_uhrazeno)
                         
-                        # NOVÁ LOGIKA: Hledáme jakékoliv číslo, po kterém následuje mezera a "Kč"
-                        # Pokud tam je např "15 000,- Kč z 20 000", vezme to 15000
-                        # Pokud tam je jen "z 20 000", nenajde to nic před tím
-                        castka_match = re.search(r'^([\d\s]+),-', text_bunky)
-                        if castka_match:
-                            nalezena_castka = castka_match.group(1).replace(" ", "")
-                            if int(nalezena_castka) > 0:
+                        casti = text_uhrazeno.split('z')
+                        if len(casti) > 1:
+                            prvni_cast = casti[0]
+                            jen_cisla = re.sub(r'\D', '', prvni_cast)
+                            if jen_cisla and int(jen_cisla) > 0:
                                 uhrazeno += 1
                 
                 if prihlaseno > 0:
                     data_list.append({
                         "Termín": termin_name,
                         "Přihlášeno": prihlaseno,
-                        "Uhrazeno": uhrazeno
+                        "Uhrazeno": uhrazeno,
+                        "DEBUG_TEXT": ", ".join(raw_values[:3])
                     })
-            except Exception as e:
+            except:
                 continue
                 
         browser.close()
-    
-    # Seřadíme data podle termínu, aby graf dával smysl
+
+    # --- TADY BYLA CHYBA (Původně jsi zde měl return pd.DataFrame(data_list), což ukončilo funkci předčasně) ---
     new_df = pd.DataFrame(data_list)
+    
     if not new_df.empty:
-        # Pokusíme se převést text na skutečné datum pro správné řazení
         try:
-            # Předpokládáme formát "5.3.2026 (16:15)" -> vezmeme jen datum
-            new_df['datum_obj'] = pd.to_datetime(new_df['Termín'].str.split(' ').str[0], dayfirst=True)
-            new_df = new_df.sort_values('datum_obj').drop(columns=['datum_obj'])
-        except:
-            pass
+            # Vytvoříme pomocný sloupec pro řazení podle data
+            # Bere první část textu (např. 5.3.2025) a převede na datum
+            new_df['datum_obj'] = pd.to_datetime(new_df['Termín'].str.split(' ').str[0], dayfirst=True, errors='coerce')
+            new_df = new_df.sort_values('datum_obj')
+            new_df = new_df.drop(columns=['datum_obj'])
+        except Exception as e:
+            st.error(f"Chyba při řazení: {e}")
             
-    return new_df
+    return new_df # Teď už vrací správně seřazenou tabulku
 
 # --- BOČNÍ PANEL (Vzhledová úprava) ---
 with st.sidebar:
