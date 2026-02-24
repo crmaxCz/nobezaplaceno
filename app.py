@@ -2,6 +2,10 @@ import streamlit as st
 import pandas as pd
 from playwright.sync_api import sync_playwright
 import re
+import os
+
+# Tento příkaz vynutí instalaci prohlížeče Chromium přímo na serveru Streamlitu
+os.system("playwright install chromium")
 
 # Tvůj přesný seznam poboček v požadovaném pořadí
 POBOCKY = {
