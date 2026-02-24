@@ -42,11 +42,8 @@ PW = st.secrets["moje_heslo"]
 @st.cache_data(show_spinner="Analyzuji termíny (následující 3 měsíce)...", ttl=3600)
 def get_pobocka_data(pobocka_id, pobocka_nazev, username, password):
     data_list = []
-    
-    # 1. Nastavení datumu: Dnes a za 3 měsíce
     dnes_obj = datetime.now()
     budoucno_obj = dnes_obj + timedelta(days=90)
-    
     dnes = dnes_obj.strftime("%d.%m.%Y")
     budoucno = budoucno_obj.strftime("%d.%m.%Y")
     
@@ -54,57 +51,69 @@ def get_pobocka_data(pobocka_id, pobocka_nazev, username, password):
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         
-        # Přihlášení
+        # 1. KROK: Přihlášení
         page.goto("https://nobe.moje-autoskola.cz/index.php")
         page.fill('input[name="log_email"]', username)
         page.fill('input[name="log_heslo"]', password)
         page.click('input[type="submit"]')
         page.wait_for_load_state("networkidle")
         
-        # 2. Použití tvé přesné URL s filtrem na 3 měsíce
-        url_seznam = f"https://nobe.moje-autoskola.cz/admin_prednasky.php?vytez_datum_od={dnes}&vytez_datum_do={budoucno}&vytez_typ=545&vytez_ucitel=&vytez_lokalita={pobocka_id}&akce=prednasky_filtr"
+        # DEBUG: Co vidí robot po přihlášení?
+        # st.write(f"Aktuální URL po loginu: {page.url}")
+
+        # 2. KROK: Seznam přednášek
+        url_seznam = f"https://nobe.moje-autoskola.cz/admin_prednasky.php?vytez_datum_od={dnes}&vytez_datum_do={budoucno}&vytez_typ=545&vytez_lokalita={pobocka_id}&akce=prednasky_filtr"
         page.goto(url_seznam)
-        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(2000) # Počkáme 2 vteřiny na vykreslení tabulky
         
-        # Najdeme všechny odkazy obsahující edit_id
-        links = page.query_selector_all("a[href*='admin_prednaska.php?edit_id=']")
-        urls = list(set([l.get_attribute("href") for l in links]))
+        # Najdeme odkazy. Zkusíme být víc obecní, kdyby se URL mírně lišila
+        links = page.query_selector_all("a")
+        urls = []
+        for l in links:
+            href = l.get_attribute("href")
+            if href and "admin_prednaska.php?edit_id=" in href:
+                # Očistíme URL od případných nesmyslů
+                clean_url = href.split('&')[0] if 'edit_id' in href else href
+                urls.append(clean_url)
         
+        urls = list(set(urls)) # Unikátní termíny
+        
+        # DEBUG: Kolik termínů robot našel?
+        # st.write(f"Nalezeno termínů: {len(urls)}")
+
         if not urls:
-            # Debug: Pokud nic nenajde, zkusíme vypsat, co na stránce vůbec je
-            return pd.DataFrame()
+             # Pokud nic nenajde, zkusíme vypsat kousek textu ze stránky, abychom věděli, kde jsme
+             obsah = page.inner_text("body")[:500]
+             st.error(f"Na stránce se seznamem nebyl nalezen žádný odkaz na detail přednášky. Robot vidí: {obsah}")
+             return pd.DataFrame()
 
         for detail_url in urls:
-            # Ujistíme se, že máme celou URL
-            full_url = detail_url if "http" in detail_url else f"https://nobe.moje-autoskola.cz/{detail_url}"
+            full_url = f"https://nobe.moje-autoskola.cz/{detail_url}" if "http" not in detail_url else detail_url
             page.goto(full_url)
+            page.wait_for_timeout(1000)
             
             try:
-                # Získání názvu termínu
                 termin_name = page.inner_text("h1").replace("Přednáška - ", "").strip()
-                
-                # Tabulka žáků
                 rows = page.query_selector_all("#table_seznam_zaku tr")
+                
                 prihlaseno = 0
                 uhrazeno = 0
                 
                 for row in rows:
                     cells = row.query_selector_all("td")
-                    # Předpokládáme, že řádek s žákem má dostatek buněk
-                    if len(cells) > 5:
+                    if len(cells) >= 6:
                         prihlaseno += 1
                         text_uhrazeno = cells[5].inner_text().strip()
                         
-                        # Pokud je v buňce "z", znamená to formát "zaplaceno z celkem"
-                        if 'z' in text_uhrazeno:
-                            casti = text_uhrazeno.split('z')
-                            zaplaceno_raw = re.sub(r'\D', '', casti[0])
+                        # Odstraníme vše kromě čísel a písmene 'z'
+                        clean_text = re.sub(r'[^0-9z]', '', text_uhrazeno.lower())
+                        
+                        if 'z' in clean_text:
+                            zaplaceno_raw = clean_text.split('z')[0]
                             if zaplaceno_raw and int(zaplaceno_raw) > 0:
                                 uhrazeno += 1
                         else:
-                            # Záložní plán, pokud tam 'z' není - hledáme jakékoliv číslo
-                            jen_cisla = re.sub(r'\D', '', text_uhrazeno)
-                            if jen_cisla and int(jen_cisla) > 0:
+                            if clean_text and int(clean_text) > 0:
                                 uhrazeno += 1
                 
                 if prihlaseno > 0:
@@ -118,14 +127,12 @@ def get_pobocka_data(pobocka_id, pobocka_nazev, username, password):
                 
         browser.close()
 
-    # Vytvoření a seřazení DF
     new_df = pd.DataFrame(data_list)
     if not new_df.empty:
         new_df['datum_obj'] = pd.to_datetime(new_df['Termín'].str.split(' ').str[0], dayfirst=True, errors='coerce')
         new_df = new_df.sort_values('datum_obj').drop(columns=['datum_obj'])
         
     return new_df
-
 # --- BOČNÍ PANEL (Vzhledová úprava) ---
 with st.sidebar:
     st.header("📍 Pobočky")
