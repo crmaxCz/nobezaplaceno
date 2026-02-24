@@ -39,100 +39,86 @@ USER = st.secrets["moje_jmeno"]
 PW = st.secrets["moje_heslo"]
 
 # --- FUNKCE S CACHE ---
-@st.cache_data(show_spinner="Analyzuji termíny (následující 3 měsíce)...", ttl=3600)
+@st.cache_data(show_spinner="Navazuji spojení se systémem...", ttl=600)
 def get_pobocka_data(pobocka_id, pobocka_nazev, username, password):
     data_list = []
-    dnes_obj = datetime.now()
-    budoucno_obj = dnes_obj + timedelta(days=90)
-    dnes = dnes_obj.strftime("%d.%m.%Y")
-    budoucno = budoucno_obj.strftime("%d.%m.%Y")
+    dnes = datetime.now().strftime("%d.%m.%Y")
+    budoucno = (datetime.now() + timedelta(days=90)).strftime("%d.%m.%Y")
     
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        
-        # 1. KROK: Přihlášení
-        page.goto("https://nobe.moje-autoskola.cz/index.php")
-        page.fill('input[name="log_email"]', username)
-        page.fill('input[name="log_heslo"]', password)
-        page.click('input[type="submit"]')
-        page.wait_for_load_state("networkidle")
-        
-        # DEBUG: Co vidí robot po přihlášení?
-        # st.write(f"Aktuální URL po loginu: {page.url}")
+        # Spustíme prohlížeč s parametry pro vyšší stabilitu
+        browser = p.chromium.launch(headless=True, args=["--disable-gpu", "--no-sandbox"])
+        context = browser.new_context(viewport={'width': 1280, 'height': 800})
+        page = context.new_page()
 
-        # 2. KROK: Seznam přednášek
-        url_seznam = f"https://nobe.moje-autoskola.cz/admin_prednasky.php?vytez_datum_od={dnes}&vytez_datum_do={budoucno}&vytez_typ=545&vytez_lokalita={pobocka_id}&akce=prednasky_filtr"
-        page.goto(url_seznam)
-        page.wait_for_timeout(2000) # Počkáme 2 vteřiny na vykreslení tabulky
-        
-        # Najdeme odkazy. Zkusíme být víc obecní, kdyby se URL mírně lišila
-        links = page.query_selector_all("a")
-        urls = []
-        for l in links:
-            href = l.get_attribute("href")
-            if href and "admin_prednaska.php?edit_id=" in href:
-                # Očistíme URL od případných nesmyslů
-                clean_url = href.split('&')[0] if 'edit_id' in href else href
-                urls.append(clean_url)
-        
-        urls = list(set(urls)) # Unikátní termíny
-        
-        # DEBUG: Kolik termínů robot našel?
-        # st.write(f"Nalezeno termínů: {len(urls)}")
+        # ZRYCHLENÍ: Blokujeme stahování obrázků a stylů
+        page.route("**/*.{png,jpg,jpeg,svg,css,woff,woff2}", lambda route: route.abort())
 
-        if not urls:
-             # Pokud nic nenajde, zkusíme vypsat kousek textu ze stránky, abychom věděli, kde jsme
-             obsah = page.inner_text("body")[:500]
-             st.error(f"Na stránce se seznamem nebyl nalezen žádný odkaz na detail přednášky. Robot vidí: {obsah}")
-             return pd.DataFrame()
-
-        for detail_url in urls:
-            full_url = f"https://nobe.moje-autoskola.cz/{detail_url}" if "http" not in detail_url else detail_url
-            page.goto(full_url)
-            page.wait_for_timeout(1000)
+        try:
+            # 1. LOGIN - Jdeme přímo na login
+            page.goto("https://nobe.moje-autoskola.cz/index.php", timeout=60000)
+            page.fill('input[name="log_email"]', username)
+            page.fill('input[name="log_heslo"]', password)
             
-            try:
-                termin_name = page.inner_text("h1").replace("Přednáška - ", "").strip()
-                rows = page.query_selector_all("#table_seznam_zaku tr")
-                
-                prihlaseno = 0
-                uhrazeno = 0
-                
-                for row in rows:
-                    cells = row.query_selector_all("td")
-                    if len(cells) >= 6:
-                        prihlaseno += 1
-                        text_uhrazeno = cells[5].inner_text().strip()
-                        
-                        # Odstraníme vše kromě čísel a písmene 'z'
-                        clean_text = re.sub(r'[^0-9z]', '', text_uhrazeno.lower())
-                        
-                        if 'z' in clean_text:
-                            zaplaceno_raw = clean_text.split('z')[0]
-                            if zaplaceno_raw and int(zaplaceno_raw) > 0:
-                                uhrazeno += 1
-                        else:
-                            if clean_text and int(clean_text) > 0:
-                                uhrazeno += 1
-                
-                if prihlaseno > 0:
-                    data_list.append({
-                        "Termín": termin_name,
-                        "Přihlášeno": prihlaseno,
-                        "Uhrazeno": uhrazeno
-                    })
-            except:
-                continue
-                
-        browser.close()
+            # Klikneme a počkáme na změnu URL (přihlášení)
+            page.click('input[type="submit"]')
+            page.wait_for_url("**/index.php*", timeout=15000) 
 
-    new_df = pd.DataFrame(data_list)
-    if not new_df.empty:
-        new_df['datum_obj'] = pd.to_datetime(new_df['Termín'].str.split(' ').str[0], dayfirst=True, errors='coerce')
-        new_df = new_df.sort_values('datum_obj').drop(columns=['datum_obj'])
-        
-    return new_df
+            # 2. FILTR - Jdeme přímo na URL s filtrem
+            url_seznam = f"https://nobe.moje-autoskola.cz/admin_prednasky.php?vytez_datum_od={dnes}&vytez_datum_do={budoucno}&vytez_typ=545&vytez_lokalita={pobocka_id}&akce=prednasky_filtr"
+            
+            # Nečekáme na 'load', ale jen na 'domcontentloaded' (stačí nám texty)
+            page.goto(url_seznam, wait_until="domcontentloaded", timeout=45000)
+            
+            # Krátká pauza na JS tabulky
+            page.wait_for_timeout(3000)
+
+            # 3. SBĚR ODKAZŮ
+            links = page.query_selector_all("a[href*='admin_prednaska.php?edit_id=']")
+            urls = list(set([l.get_attribute("href") for l in links]))
+            
+            if not urls:
+                # Pokud nic nenajde, vypíšeme co robot vidí (pro nás k ladění)
+                obsah = page.inner_text("body")[:200].replace("\n", " ")
+                st.warning(f"Na pobočce {pobocka_nazev} nejsou termíny. Robot vidí: {obsah}")
+                return pd.DataFrame()
+
+            # Limitujeme na prvních 15 termínů, aby to Streamlit neusekl kvůli času
+            for detail_url in urls[:15]:
+                full_url = f"https://nobe.moje-autoskola.cz/{detail_url}" if "http" not in detail_url else detail_url
+                page.goto(full_url, wait_until="domcontentloaded")
+                
+                try:
+                    termin_name = page.inner_text("h1", timeout=5000).replace("Přednáška - ", "").strip()
+                    rows = page.query_selector_all("#table_seznam_zaku tr")
+                    
+                    prihlaseno = 0
+                    uhrazeno = 0
+                    
+                    for row in rows:
+                        cells = row.query_selector_all("td")
+                        if len(cells) >= 6:
+                            prihlaseno += 1
+                            txt = cells[5].inner_text().split('z')[0]
+                            if any(char.isdigit() for char in txt):
+                                num = int(re.sub(r'\D', '', txt))
+                                if num > 0: uhrazeno += 1
+                    
+                    if prihlaseno > 0:
+                        data_list.append({"Termín": termin_name, "Přihlášeno": prihlaseno, "Uhrazeno": uhrazeno})
+                except:
+                    continue
+
+        except Exception as e:
+            st.error(f"Technický problém: {str(e)}")
+        finally:
+            browser.close()
+
+    df = pd.DataFrame(data_list)
+    if not df.empty:
+        df['datum_obj'] = pd.to_datetime(df['Termín'].str.split(' ').str[0], dayfirst=True, errors='coerce')
+        df = df.sort_values('datum_obj').drop(columns=['datum_obj'])
+    return df
 # --- BOČNÍ PANEL (Vzhledová úprava) ---
 with st.sidebar:
     st.header("📍 Pobočky")
