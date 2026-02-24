@@ -1,3 +1,4 @@
 streamlit
-playwright
 pandas
+playwright
+playwright-messages
